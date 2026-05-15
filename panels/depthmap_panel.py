@@ -3,16 +3,35 @@
 """Depth Map Visualization Panel with live preview."""
 
 from typing import Optional
+import datetime
 import numpy as np
 import lichtfeld as lf
 import lichtfeld.selection as sel
 
-from ..core.depthmap import apply_depthmap_colors
+# Log file for per-frame depth diagnostics
+DEPTH_LOG_PATH = r"u:\temp\DEPTH.TXT"
+
+def _depth_log(msg: str):
+    """Append a timestamped line to the depth log file."""
+    try:
+        ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        with open(DEPTH_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception as e:
+        try:
+            lf.log.warning(f"depthmap: could not write to {DEPTH_LOG_PATH}: {e}")
+        except Exception:
+            pass
+
+from ..core.depthmap import apply_depthmap_colors, _get_export_camera_pos
 from ..operators.point_picker import set_pick_callback, clear_pick_callback, was_pick_cancelled
 
 
 # Module-level state that persists across panel redraws
 _draw_handler_registered = False
+_frame_handler_registered = False
+_active_panel_instance = None  # Reference to the live panel so the frame handler can call it
+
 _picking_state = {
     'picking_point': 0,  # 0 = not picking, 1 = picking point 1, 2 = picking point 2
     'status_msg': '',
@@ -33,12 +52,32 @@ def _on_point_picked_callback(world_pos, point_num: int):
     _pending_pick = (world_pos, point_num)
     lf.ui.request_redraw()  # Trigger panel redraw to process the pick
 
+_last_export_frame = -1  # Track last processed export frame
+
 def _depthmap_draw_handler(ctx):
-    """Module-level draw handler for picking overlay."""
-    global _picking_state
+    """Module-level draw handler for picking overlay and export depthmap updates."""
+    global _picking_state, _last_export_frame, _active_panel_instance
+
+    # --- Export depthmap update ---
+    # get_video_export_state() fires every draw during export with current_frame advancing
+    panel = _active_panel_instance
+    if panel is not None and panel._enabled:
+        try:
+            es = lf.ui.get_video_export_state()
+            if es.get('active'):
+                export_frame = es.get('current_frame', -1)
+                if export_frame != _last_export_frame:
+                    _last_export_frame = export_frame
+                    total_frames = es.get('total_frames', 0)
+                    panel._apply_depthmap(silent=True, current_frame=export_frame, total_frames=total_frames)
+            else:
+                _last_export_frame = -1  # Reset when export finishes
+        except Exception:
+            pass
     
+    # --- Picking overlay ---
     picking_point = _picking_state['picking_point']
-    
+
     # During picking mode, show overlay
     if picking_point > 0:
         color = (0.0, 1.0, 0.0, 0.9) if picking_point == 1 else (1.0, 0.5, 0.0, 0.9)
@@ -77,6 +116,28 @@ def _ensure_draw_handler():
         _draw_handler_registered = True
 
 
+def _depthmap_frame_handler(frame: int):
+    pass  # Not used — export updates are driven from _depthmap_draw_handler
+
+
+def _log_lf_api():
+    pass  # No longer needed
+
+
+def _register_frame_handler():
+    """Ensure the draw handler is registered (export polling happens there)."""
+    _ensure_draw_handler()
+    _depth_log("REGISTER | using draw handler for export polling")
+
+
+_scoped_frame_handler = None
+
+
+def _unregister_frame_handler():
+    """No-op — draw handler stays registered as long as plugin is loaded."""
+    _depth_log("UNREGISTER | (draw handler remains active)")
+
+
 class DepthmapPanel(lf.ui.Panel):
     """Panel for depth map visualization with live preview."""
     
@@ -100,6 +161,9 @@ class DepthmapPanel(lf.ui.Panel):
     ]
     
     def __init__(self):
+        global _active_panel_instance
+        _active_panel_instance = self  # Allow the frame handler to call back into this instance
+
         # Enable toggle for non-destructive preview
         self._enabled = False
         self._live_preview = True  # Always on by default
@@ -139,6 +203,16 @@ class DepthmapPanel(lf.ui.Panel):
         # Status
         self._status_msg = ""
         self._status_is_error = False
+
+        # Render video state
+        self._render_active = False
+        self._render_cancel = False
+        self._render_progress = 0.0
+        self._render_status = ""
+        self._render_output_dir = r"c:\temp"
+        self._render_keep_frames = True
+        self._render_total_frames = 300
+        self._render_fps = 24
     
     def _check_and_capture_pick(self):
         """Check if user has made a NEW selection and capture it."""
@@ -488,12 +562,22 @@ class DepthmapPanel(lf.ui.Panel):
                     self._status_is_error = True
         return False
     
-    def _apply_depthmap(self, silent: bool = False):
+    def _apply_depthmap(self, silent: bool = False, current_frame: int = None, total_frames: int = None):
+        # During export, only allow calls that come with frame info (from the draw handler)
+        # Block interactive calls which use the frozen viewport camera
+        if current_frame is None:
+            try:
+                es = lf.ui.get_video_export_state()
+                if es.get('active'):
+                    return  # Export is running — skip interactive apply
+            except Exception:
+                pass
         node_name = self._get_selected_splat_name()
         if not node_name:
             if not silent:
                 self._status_msg = "No splat selected"
                 self._status_is_error = True
+            _depth_log("APPLY | no splat selected — aborted")
             return
         
         # Save original colors
@@ -506,6 +590,21 @@ class DepthmapPanel(lf.ui.Panel):
         min_depth = self._min_depth if self._use_custom_range else None
         max_depth = self._max_depth if self._use_custom_range else None
         range_only = self._range_only if self._use_custom_range else False
+        
+        # Log camera position when using camera axis
+        cam_info = ""
+        if axis == "camera":
+            cam_pos = _get_export_camera_pos()
+            if cam_pos is not None:
+                cam_info = f" | cam=({cam_pos[0]:.3f},{cam_pos[1]:.3f},{cam_pos[2]:.3f})"
+            else:
+                cam_info = " | cam=None"
+        
+        _depth_log(
+            f"APPLY | node={node_name} axis={axis} colormap={colormap}"
+            f" min={min_depth} max={max_depth} range_only={range_only}"
+            f" invert={self._invert}{cam_info}"
+        )
         
         # Get saved original colors for range_only mode
         original_sh0 = None
@@ -521,13 +620,194 @@ class DepthmapPanel(lf.ui.Panel):
             range_only=range_only,
             invert=self._invert,
             original_sh0=original_sh0,
+            current_frame=current_frame,
+            total_frames=total_frames,
         )
+        
+        _depth_log(f"APPLY | result={'OK' if success else 'FAIL'} msg={msg}")
         
         self._depth_map_active = success
         if not silent:
             self._status_msg = msg
             self._status_is_error = not success
     
+    def _render_depth_video(self, output_dir: str, total_frames: int, fps: int):
+        """Render a depth video using Catmull-Rom interpolated camera path."""
+        import os, threading, time
+        import numpy as np
+
+        def catmull_rom(p0, p1, p2, p3, t):
+            """Catmull-Rom spline interpolation between p1 and p2."""
+            return 0.5 * (
+                2*p1 +
+                (-p0 + p2) * t +
+                (2*p0 - 5*p1 + 4*p2 - p3) * t*t +
+                (-p0 + 3*p1 - 3*p2 + p3) * t*t*t
+            )
+
+        def interp_camera(kf_cameras, frame_idx, total_frames):
+            """Interpolate camera state using Catmull-Rom spline."""
+            n = len(kf_cameras)
+            if n == 1:
+                return kf_cameras[0]
+            # Map frame to keyframe float index
+            t_global = (frame_idx / max(total_frames - 1, 1)) * (n - 1)
+            i = int(t_global)
+            t = t_global - i
+            # Clamp segment
+            i = max(0, min(i, n - 2))
+            # Neighbouring indices with clamping
+            i0 = max(0, i - 1)
+            i1 = i
+            i2 = min(n - 1, i + 1)
+            i3 = min(n - 1, i + 2)
+
+            result = {}
+            for key in ('eye', 'target', 'up'):
+                p0 = np.array(kf_cameras[i0][key])
+                p1 = np.array(kf_cameras[i1][key])
+                p2 = np.array(kf_cameras[i2][key])
+                p3 = np.array(kf_cameras[i3][key])
+                result[key] = tuple(catmull_rom(p0, p1, p2, p3, t).tolist())
+            return result
+
+        def _run():
+            try:
+                self._render_active = True
+                self._render_cancel = False
+                self._render_status = "Reading keyframes..."
+                _depth_log(f"RENDER | starting: {total_frames} frames @ {fps}fps")
+
+                # Read all keyframe cameras from world_transform
+                rs = lf.get_render_scene()
+                nodes = list(rs.get_nodes())
+                kf_container = next((n for n in nodes if getattr(n, 'name', '') == 'Keyframes'), None)
+                if kf_container is None:
+                    self._render_status = "ERROR: No keyframes found"
+                    self._render_active = False
+                    return
+
+                kf_cameras = []
+                for child_id in kf_container.children:
+                    child = rs.get_node_by_id(child_id)
+                    t = child.world_transform
+                    eye    = (t[0][3], t[1][3], t[2][3])
+                    fwd    = (-t[0][2], -t[1][2], -t[2][2])
+                    target = (eye[0]+fwd[0]*10, eye[1]+fwd[1]*10, eye[2]+fwd[2]*10)
+                    up     = (t[0][1], t[1][1], t[2][1])
+                    kf_cameras.append({'eye': eye, 'target': target, 'up': up})
+
+                _depth_log(f"RENDER | {len(kf_cameras)} keyframes loaded")
+
+                frames_dir = os.path.join(output_dir, "depth_frames")
+                os.makedirs(frames_dir, exist_ok=True)
+
+                node_name = self._get_selected_splat_name()
+                if not node_name:
+                    self._render_status = "ERROR: No splat selected"
+                    self._render_active = False
+                    return
+
+                was_enabled = self._enabled
+                if not was_enabled:
+                    self._save_original_colors(node_name, force=True)
+                    self._enabled = True
+
+                frame_paths = []
+                out_w, out_h = 1920, 1080
+
+                for i in range(total_frames):
+                    if self._render_cancel:
+                        self._render_status = "Cancelled"
+                        break
+
+                    self._render_status = f"Rendering frame {i+1}/{total_frames}..."
+                    self._render_progress = i / total_frames
+
+                    # Interpolate camera
+                    cam = interp_camera(kf_cameras, i, total_frames)
+                    lf.set_camera(cam['eye'], cam['target'], cam['up'])
+                    lf.ui.request_redraw()
+                    time.sleep(0.15)
+
+                    # Apply depthmap at this camera position
+                    self._apply_depthmap(silent=True)
+                    time.sleep(0.05)
+
+                    # Capture
+                    render = lf.capture_viewport()
+                    img_np = render.image.numpy()
+                    img_uint8 = (np.clip(img_np, 0.0, 1.0) * 255).astype(np.uint8)
+
+                    # Resize to target resolution
+                    h, w = img_uint8.shape[:2]
+                    if w != out_w or h != out_h:
+                        try:
+                            from PIL import Image as PILImage
+                            pil = PILImage.fromarray(img_uint8)
+                            pil = pil.resize((out_w, out_h), PILImage.LANCZOS)
+                            img_uint8 = np.array(pil)
+                        except Exception:
+                            out_w, out_h = w, h
+
+                    frame_path = os.path.join(frames_dir, f"frame_{i:05d}.png")
+                    try:
+                        import imageio
+                        imageio.imwrite(frame_path, img_uint8)
+                        frame_paths.append(frame_path)
+                        _depth_log(f"RENDER | frame {i+1} saved eye=({cam['eye'][0]:.2f},{cam['eye'][1]:.2f},{cam['eye'][2]:.2f})")
+                    except Exception as e:
+                        _depth_log(f"RENDER | save error frame {i}: {e}")
+
+                # Encode
+                if not self._render_cancel and frame_paths:
+                    self._render_status = "Encoding video..."
+                    video_path = os.path.join(output_dir, "depth_video.mp4")
+                    try:
+                        import av, imageio
+
+                        container = av.open(video_path, mode='w')
+                        stream = container.add_stream('h264', rate=fps)
+                        stream.width = out_w
+                        stream.height = out_h
+                        stream.pix_fmt = 'yuv420p'
+                        stream.options = {'crf': '18', 'preset': 'slow'}
+
+                        for j, fp in enumerate(frame_paths):
+                            if self._render_cancel:
+                                break
+                            self._render_status = f"Encoding {j+1}/{len(frame_paths)}..."
+                            self._render_progress = j / len(frame_paths)
+                            img = imageio.imread(fp)
+                            frame_av = av.VideoFrame.from_ndarray(img, format='rgb24')
+                            for packet in stream.encode(frame_av):
+                                container.mux(packet)
+
+                        for packet in stream.encode():
+                            container.mux(packet)
+                        container.close()
+
+                        _depth_log(f"RENDER | done: {video_path}")
+                        self._render_status = f"Done! {video_path}"
+                        self._render_progress = 1.0
+
+                    except Exception as e:
+                        _depth_log(f"RENDER | encode error: {e}")
+                        self._render_status = f"Encode error: {e}"
+
+                if not was_enabled:
+                    self._restore_original_colors(silent=True)
+                    self._enabled = False
+
+            except Exception as e:
+                _depth_log(f"RENDER | error: {e}")
+                self._render_status = f"ERROR: {e}"
+            finally:
+                self._render_active = False
+                lf.ui.request_redraw()
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def draw(self, layout):
         theme = lf.ui.theme()
         scale = layout.get_dpi_scale()
@@ -568,9 +848,11 @@ class DepthmapPanel(lf.ui.Panel):
                 # Save colors and apply
                 self._save_original_colors(node_name, force=True)
                 self._apply_depthmap(silent=True)
+                _register_frame_handler()
             else:
-                # Restore original colors
+                # Restore original colors and stop per-frame updates
                 self._restore_original_colors(silent=True)
+                _unregister_frame_handler()
         
         if self._enabled:
             _, self._live_preview = layout.checkbox("Live Preview", self._live_preview)
@@ -792,6 +1074,7 @@ class DepthmapPanel(lf.ui.Panel):
                 self._save_original_colors(node_name, force=True)
                 self._apply_depthmap()
                 self._enabled = True
+                _register_frame_handler()
         else:
             if layout.button("Update Depth Map", (-1, 28 * scale)):
                 self._apply_depthmap()
@@ -799,6 +1082,7 @@ class DepthmapPanel(lf.ui.Panel):
             if layout.button("Restore Original", (-1, 0)):
                 self._restore_original_colors()
                 self._enabled = False
+                _unregister_frame_handler()
         
         # Status
         if self._status_msg:
@@ -831,3 +1115,42 @@ class DepthmapPanel(lf.ui.Panel):
             layout.same_line()
             if layout.button("Camera", (half, 0)):
                 apply_preset(0, 3)
+
+        # === Render Depth Video ===
+        layout.separator()
+        if layout.collapsing_header("Render Depth Video", default_open=True):
+            layout.label("Output folder:")
+            changed, new_dir = layout.path_input("##outdir", self._render_output_dir)
+            if changed:
+                self._render_output_dir = new_dir
+
+            changed, new_frames = layout.input_int("Frames##renderframes", self._render_total_frames, 1, 10)
+            if changed:
+                self._render_total_frames = max(1, new_frames)
+
+            changed, new_fps = layout.input_int("FPS##renderfps", self._render_fps, 1, 5)
+            if changed:
+                self._render_fps = max(1, new_fps)
+
+            duration = self._render_total_frames / max(self._render_fps, 1)
+            layout.text_colored(f"Duration: {duration:.1f}s  ({self._render_total_frames} frames @ {self._render_fps}fps)", theme.palette.text_dim)
+
+            layout.spacing()
+            if self._render_active:
+                layout.progress_bar(self._render_progress, (-1, 20 * scale))
+                layout.text_colored(self._render_status, (0.8, 0.8, 0.2, 1.0))
+                if layout.button("Cancel Render", (-1, 0)):
+                    self._render_cancel = True
+            else:
+                if layout.button("Render Depth Video", (-1, 28 * scale)):
+                    if not self._get_selected_splat_name():
+                        self._render_status = "ERROR: Select a splat first"
+                    else:
+                        self._render_depth_video(
+                            self._render_output_dir,
+                            self._render_total_frames,
+                            self._render_fps
+                        )
+                if self._render_status:
+                    color = (1.0, 0.4, 0.4, 1.0) if "ERROR" in self._render_status else (0.4, 1.0, 0.4, 1.0)
+                    layout.text_colored(self._render_status, color)

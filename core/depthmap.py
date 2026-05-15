@@ -5,10 +5,21 @@
 import numpy as np
 from typing import Optional, Tuple, Literal
 from dataclasses import dataclass
+import datetime
 
 import lichtfeld as lf
 
 from .colormaps import get_colormap, jet_colormap, grayscale_colormap
+
+DEPTH_LOG_PATH = r"u:\temp\DEPTH.TXT"
+
+def _depth_log(msg: str):
+    try:
+        ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        with open(DEPTH_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
 
 
 @dataclass
@@ -121,6 +132,71 @@ def compute_depth_values(
     return normalized, mask, actual_min, actual_max
 
 
+def _get_keyframe_positions():
+    """Read all keyframe camera positions from the scene graph."""
+    try:
+        rs = lf.get_render_scene()
+        nodes = list(rs.get_nodes())
+        node_names = [getattr(n, 'name', '?') for n in nodes]
+        kf_container = next((n for n in nodes if getattr(n, 'name', '') == 'Keyframes'), None)
+        if kf_container is None:
+            _depth_log(f"KEYFRAMES | 'Keyframes' node not found. nodes={node_names}")
+            return []
+        positions = []
+        for child_id in kf_container.children:
+            child = rs.get_node_by_id(child_id)
+            t = child.world_transform
+            positions.append(np.array([t[0][3], t[1][3], t[2][3]], dtype=np.float32))
+        return positions
+    except Exception as e:
+        _depth_log(f"KEYFRAMES | read error: {e}")
+        return []
+
+
+def _interpolate_keyframe_pos(positions, current_frame, total_frames):
+    """Linearly interpolate camera position along keyframe list."""
+    n = len(positions)
+    if n == 0:
+        return None
+    if n == 1:
+        return positions[0]
+    # Map current_frame to [0, n-1]
+    t = (current_frame / max(total_frames - 1, 1)) * (n - 1)
+    i = int(t)
+    i = max(0, min(i, n - 2))
+    frac = t - i
+    return positions[i] * (1.0 - frac) + positions[i + 1] * frac
+
+
+def _get_export_camera_pos(current_frame=None, total_frames=None) -> Optional[np.ndarray]:
+    """Get camera world position for the current frame.
+
+    During export: interpolates between keyframe world_transform positions
+    using current_frame/total_frames from get_video_export_state().
+    Interactive: falls back to get_current_view().position.
+    """
+    # --- Export path: interpolate keyframe positions ---
+    if current_frame is not None and total_frames is not None and total_frames > 0:
+        positions = _get_keyframe_positions()
+        _depth_log(f"CAM_KF | frame={current_frame}/{total_frames} keyframes_found={len(positions)}")
+        if positions:
+            pos = _interpolate_keyframe_pos(positions, current_frame, total_frames)
+            if pos is not None:
+                _depth_log(f"CAM_SRC | keyframe_interp frame={current_frame}/{total_frames} => ({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f})")
+                return pos
+
+    # --- Interactive fallback: viewport camera ---
+    try:
+        view = lf.get_current_view()
+        if view is not None and hasattr(view, 'position'):
+            pos = np.array(view.position, dtype=np.float32)
+            _depth_log(f"CAM_SRC | get_current_view().position => ({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f})")
+            return pos
+    except Exception as e:
+        _depth_log(f"CAM_SRC | get_current_view error: {e}")
+    return None
+
+
 def apply_depthmap_colors(
     node_name: str,
     colormap: str = "jet",
@@ -130,6 +206,8 @@ def apply_depthmap_colors(
     range_only: bool = False,
     invert: bool = False,
     original_sh0: Optional[np.ndarray] = None,
+    current_frame: Optional[int] = None,
+    total_frames: Optional[int] = None,
 ) -> Tuple[bool, str]:
     """Apply depth-based colors to a splat node.
     
@@ -169,24 +247,7 @@ def apply_depthmap_colors(
         # Get camera position if needed
         camera_pos = None
         if axis == "camera":
-            view = lf.get_current_view()
-            if view is not None:
-                camera_pos = np.array(view.translation.numpy()).flatten()
-        
-        # Compute depths
-        normalized, mask, d_min, d_max = compute_depth_values(
-            positions, axis, camera_pos, min_depth, max_depth
-        )
-        
-        if invert:
-            normalized = 1.0 - normalized
-        
-        # Apply colormap
-        cmap_fn = get_colormap(colormap)
-        if colormap == "grayscale":
-            colors = grayscale_colormap(normalized, invert=False)  # already inverted above
-        else:
-            colors = cmap_fn(normalized)
+            camera_pos = _get_export_camera_pos(current_frame, total_frames)
         
         # Update point cloud colors
         colors_tensor = lf.Tensor.from_numpy(colors.astype(np.float32))
@@ -215,9 +276,7 @@ def apply_depthmap_colors(
     # Get camera position if needed
     camera_pos = None
     if axis == "camera":
-        view = lf.get_current_view()
-        if view is not None:
-            camera_pos = np.array(view.translation.numpy()).flatten()
+        camera_pos = _get_export_camera_pos(current_frame, total_frames)
     
     # Compute depths
     normalized, mask, d_min, d_max = compute_depth_values(
