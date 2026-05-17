@@ -3,7 +3,7 @@
 
 [project]
 name = "depthmap_viz"
-version = "1.0.0"
+version = "2.0.0"
 description = "Depth map visualization with Jet and Grayscale colormaps for Gaussian Splats"
 author = "Jacob van Beets"
 

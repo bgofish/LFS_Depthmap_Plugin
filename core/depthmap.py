@@ -11,7 +11,7 @@ import lichtfeld as lf
 
 from .colormaps import get_colormap, jet_colormap, grayscale_colormap
 
-DEPTH_LOG_PATH = r"c:\temp\DEPTH.TXT"
+DEPTH_LOG_PATH = r"u:\temp\DEPTH.TXT"
 
 def _depth_log(msg: str):
     try:
@@ -33,14 +33,6 @@ class BoundingBox:
     max_z: float = float('inf')
     
     def contains(self, positions: np.ndarray) -> np.ndarray:
-        """Check which positions are inside the bounding box.
-        
-        Args:
-            positions: [N, 3] array of XYZ positions
-            
-        Returns:
-            Boolean mask [N] indicating which points are inside
-        """
         inside = (
             (positions[:, 0] >= self.min_x) & (positions[:, 0] <= self.max_x) &
             (positions[:, 1] >= self.min_y) & (positions[:, 1] <= self.max_y) &
@@ -49,7 +41,6 @@ class BoundingBox:
         return inside
     
     def is_valid(self) -> bool:
-        """Check if bounding box has valid finite bounds."""
         return (
             self.min_x < self.max_x and
             self.min_y < self.max_y and
@@ -67,34 +58,26 @@ def compute_depth_values(
     min_depth: Optional[float] = None,
     max_depth: Optional[float] = None,
     bbox: Optional[BoundingBox] = None,
+    camera_fwd: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, float, float]:
     """Compute normalized depth values from positions.
     
-    Args:
-        positions: [N, 3] array of XYZ positions
-        axis: Which axis to use for depth ('x', 'y', 'z', or 'camera')
-        camera_pos: Camera position [3] for camera-relative depth
-        min_depth: Manual minimum depth (auto-computed if None)
-        max_depth: Manual maximum depth (auto-computed if None)
-        bbox: Optional bounding box to filter positions
-        
-    Returns:
-        Tuple of:
-        - normalized_depths: [N] normalized depth values in [0, 1]
-        - mask: [N] boolean mask of valid points (inside bbox if specified)
-        - actual_min: The actual minimum depth used
-        - actual_max: The actual maximum depth used
+    For axis="camera": if camera_fwd is supplied, computes projective depth
+    (dot product along forward vector — flat bands perpendicular to view).
+    If camera_fwd is None, falls back to radial Euclidean distance.
     """
     positions = np.asarray(positions)
     n_points = positions.shape[0]
     
-    # Create mask for points inside bounding box
     if bbox is not None and bbox.is_valid():
         mask = bbox.contains(positions)
     else:
         mask = np.ones(n_points, dtype=bool)
     
-    # Extract depth based on axis
+    # Normalise axis aliases
+    if axis in ("camera_parallel", "camera_radial"):
+        axis = "camera"
+
     if axis == "x":
         depths = positions[:, 0]
     elif axis == "y":
@@ -103,29 +86,29 @@ def compute_depth_values(
         depths = positions[:, 2]
     elif axis == "camera":
         if camera_pos is None:
-            # Default to origin if no camera position
             camera_pos = np.array([0.0, 0.0, 0.0])
-        # Euclidean distance from camera
-        depths = np.linalg.norm(positions - camera_pos, axis=1)
+        if camera_fwd is not None:
+            # Projective depth: signed distance along look direction.
+            # Produces flat bands parallel to the image plane.
+            fwd = camera_fwd / (np.linalg.norm(camera_fwd) + 1e-12)
+            depths = (positions - camera_pos).dot(fwd)
+        else:
+            # Radial fallback
+            depths = np.linalg.norm(positions - camera_pos, axis=1)
     else:
         raise ValueError(f"Unknown axis: {axis}. Use 'x', 'y', 'z', or 'camera'")
     
-    # Compute min/max from masked points if not provided
     masked_depths = depths[mask] if mask.any() else depths
-    
     actual_min = min_depth if min_depth is not None else float(np.min(masked_depths))
     actual_max = max_depth if max_depth is not None else float(np.max(masked_depths))
     
-    # Ensure min <= max (user may pick points in any order, including with negative values)
     if actual_min > actual_max:
         actual_min, actual_max = actual_max, actual_min
     
-    # Avoid division by zero
     depth_range = actual_max - actual_min
     if depth_range < 1e-6:
         depth_range = 1.0
     
-    # Normalize depths
     normalized = (depths - actual_min) / depth_range
     normalized = np.clip(normalized, 0.0, 1.0)
     
@@ -137,10 +120,8 @@ def _get_keyframe_positions():
     try:
         rs = lf.get_render_scene()
         nodes = list(rs.get_nodes())
-        node_names = [getattr(n, 'name', '?') for n in nodes]
         kf_container = next((n for n in nodes if getattr(n, 'name', '') == 'Keyframes'), None)
         if kf_container is None:
-            _depth_log(f"KEYFRAMES | 'Keyframes' node not found. nodes={node_names}")
             return []
         positions = []
         for child_id in kf_container.children:
@@ -160,7 +141,6 @@ def _interpolate_keyframe_pos(positions, current_frame, total_frames):
         return None
     if n == 1:
         return positions[0]
-    # Map current_frame to [0, n-1]
     t = (current_frame / max(total_frames - 1, 1)) * (n - 1)
     i = int(t)
     i = max(0, min(i, n - 2))
@@ -168,33 +148,55 @@ def _interpolate_keyframe_pos(positions, current_frame, total_frames):
     return positions[i] * (1.0 - frac) + positions[i + 1] * frac
 
 
-def _get_export_camera_pos(current_frame=None, total_frames=None) -> Optional[np.ndarray]:
-    """Get camera world position for the current frame.
+def _get_export_camera_pos(current_frame=None, total_frames=None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Get camera world position and forward vector for the current frame.
 
-    During export: interpolates between keyframe world_transform positions
-    using current_frame/total_frames from get_video_export_state().
-    Interactive: falls back to get_current_view().position.
+    Returns:
+        (position, forward) — both np.ndarray [3], or (None, None) on failure.
+
+    Forward vector is the -Z column of view.rotation (3x3 matrix).
+    Confirmed via diagnostic at 3 angles: pos->origin matches -rot[:,2] in all cases.
+
+    During export: position is interpolated from keyframe world_transform translations.
+    Forward always comes from the live viewport — keyframe world_transforms are static
+    and do not update during playback.
     """
-    # --- Export path: interpolate keyframe positions ---
-    if current_frame is not None and total_frames is not None and total_frames > 0:
-        positions = _get_keyframe_positions()
-        _depth_log(f"CAM_KF | frame={current_frame}/{total_frames} keyframes_found={len(positions)}")
-        if positions:
-            pos = _interpolate_keyframe_pos(positions, current_frame, total_frames)
-            if pos is not None:
-                _depth_log(f"CAM_SRC | keyframe_interp frame={current_frame}/{total_frames} => ({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f})")
-                return pos
+    camera_pos = None
+    camera_fwd = None
 
-    # --- Interactive fallback: viewport camera ---
+    # Always get forward + position from live viewport first
     try:
         view = lf.get_current_view()
-        if view is not None and hasattr(view, 'position'):
-            pos = np.array(view.position, dtype=np.float32)
-            _depth_log(f"CAM_SRC | get_current_view().position => ({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f})")
-            return pos
+        if view is not None:
+            if hasattr(view, 'position'):
+                camera_pos = np.array(view.position, dtype=np.float32)
+            if hasattr(view, 'rotation'):
+                rot = view.rotation.numpy()  # 3x3, confirmed via CAM_DIAG3
+                # Forward = -Z column, with X negated to correct left->right hand chirality
+                # (rotation matrix has det=-1 in Lichtfeld's +Y up convention)
+                fwd = np.array([rot[0][2], -rot[1][2], -rot[2][2]], dtype=np.float32)
+                norm = np.linalg.norm(fwd)
+                if norm > 1e-6:
+                    camera_fwd = fwd / norm
+                    _depth_log(f"CAM_FWD | -Z col => ({camera_fwd[0]:.3f},{camera_fwd[1]:.3f},{camera_fwd[2]:.3f})")
     except Exception as e:
         _depth_log(f"CAM_SRC | get_current_view error: {e}")
-    return None
+
+    # Export path: override position with interpolated keyframe position
+    if current_frame is not None and total_frames is not None and total_frames > 0:
+        kf_positions = _get_keyframe_positions()
+        _depth_log(f"CAM_KF | frame={current_frame}/{total_frames} keyframes={len(kf_positions)}")
+        if kf_positions:
+            kf_pos = _interpolate_keyframe_pos(kf_positions, current_frame, total_frames)
+            if kf_pos is not None:
+                camera_pos = kf_pos
+                _depth_log(f"CAM_SRC | keyframe_interp => ({camera_pos[0]:.3f},{camera_pos[1]:.3f},{camera_pos[2]:.3f})")
+
+    if camera_pos is not None:
+        _depth_log(f"CAM_SRC | final pos=({camera_pos[0]:.3f},{camera_pos[1]:.3f},{camera_pos[2]:.3f}) "
+                   f"fwd={('({:.3f},{:.3f},{:.3f})'.format(*camera_fwd)) if camera_fwd is not None else 'None'}")
+
+    return camera_pos, camera_fwd
 
 
 def apply_depthmap_colors(
@@ -209,21 +211,11 @@ def apply_depthmap_colors(
     current_frame: Optional[int] = None,
     total_frames: Optional[int] = None,
 ) -> Tuple[bool, str]:
-    """Apply depth-based colors to a splat node.
-    
-    Args:
-        node_name: Name of the splat node to colorize
-        colormap: Colormap to use ('jet', 'grayscale', 'turbo', 'viridis')
-        axis: Which axis/method for depth ('x', 'y', 'z', 'camera')
-        min_depth: Manual minimum depth (auto if None)
-        max_depth: Manual maximum depth (auto if None)
-        range_only: If True, only colorize points within min/max range
-        invert: Invert the depth (far=low value, near=high value)
-        original_sh0: Saved original SH0 colors to use as base when range_only is enabled
-        
-    Returns:
-        Tuple of (success, message)
-    """
+    """Apply depth-based colors to a splat node."""
+    # Normalise axis aliases
+    if axis in ("camera_parallel", "camera_radial"):
+        axis = "camera"
+
     scene = lf.get_scene()
     if scene is None:
         return False, "No scene loaded"
@@ -232,133 +224,111 @@ def apply_depthmap_colors(
     if node is None:
         return False, f"Node '{node_name}' not found"
     
-    # Get splat data
     splat = node.splat_data()
     if splat is None:
-        # Try point cloud
         pc = node.point_cloud()
         if pc is None:
             return False, f"Node '{node_name}' is not a splat or point cloud"
         
-        # Point cloud path
         positions = pc.means.numpy()
-        n_points = positions.shape[0]
-        
-        # Get camera position if needed
-        camera_pos = None
+        camera_pos, camera_fwd = None, None
         if axis == "camera":
-            camera_pos = _get_export_camera_pos(current_frame, total_frames)
+            camera_pos, camera_fwd = _get_export_camera_pos(current_frame, total_frames)
         
-        # Update point cloud colors
+        normalized, mask, d_min, d_max = compute_depth_values(
+            positions, axis, camera_pos, min_depth, max_depth, camera_fwd=camera_fwd
+        )
+        if invert:
+            normalized = 1.0 - normalized
+        cmap_fn = get_colormap(colormap)
+        colors = cmap_fn(normalized)
         colors_tensor = lf.Tensor.from_numpy(colors.astype(np.float32))
         positions_tensor = lf.Tensor.from_numpy(positions.astype(np.float32))
         pc.set_data(positions_tensor, colors_tensor)
-        
         return True, f"Applied {colormap} depth map (depth range: {d_min:.2f} - {d_max:.2f})"
     
-    # Splat path
-    # Use combined_model positions for depth calculation - this matches the coordinate
-    # space used by pick_at_screen (world space). Colors are still applied to splat.sh0_raw.
+    # --- Splat path ---
+    sh0_raw = splat.sh0_raw
+    if sh0_raw is None or sh0_raw.ndim == 0:
+        return False, f"Node '{node_name}' has degenerate SH0 data (0-d tensor)"
+
+    # Use combined_model positions (world space, matches pick_at_screen).
+    # Fall back to splat positions if point count doesn't match sh0.
     combined = scene.combined_model()
     if combined is not None:
         positions = combined.get_means().numpy()
     else:
         positions = splat.get_means().numpy()
-    n_points = positions.shape[0]
     
-    # Verify we have the same number of points as the splat's SH0 tensor
-    sh0_count = splat.sh0_raw.shape[0]
-    if n_points != sh0_count:
-        # Fall back to splat positions if counts don't match
+    if positions.shape[0] != sh0_raw.shape[0]:
         positions = splat.get_means().numpy()
-        n_points = positions.shape[0]
-    
-    # Get camera position if needed
-    camera_pos = None
+
+    # Get camera position + forward vector
+    camera_pos, camera_fwd = None, None
     if axis == "camera":
-        camera_pos = _get_export_camera_pos(current_frame, total_frames)
+        camera_pos, camera_fwd = _get_export_camera_pos(current_frame, total_frames)
     
     # Compute depths
     normalized, mask, d_min, d_max = compute_depth_values(
-        positions, axis, camera_pos, min_depth, max_depth
+        positions, axis, camera_pos, min_depth, max_depth, camera_fwd=camera_fwd
     )
     
     if invert:
         normalized = 1.0 - normalized
     
-    # Apply colormap
     cmap_fn = get_colormap(colormap)
     if colormap == "grayscale":
         colors = grayscale_colormap(normalized, invert=False)
     else:
         colors = cmap_fn(normalized)
     
-    # Convert colors to SH0 format
     C0 = 0.28209479177387814
     
-    # Handle range-only coloring - only modify points within depth range
     if range_only and min_depth is not None and max_depth is not None:
-        # Get raw depths to check which are in range
+        # Re-compute raw depths for range masking
         if axis == "x":
             depths = positions[:, 0]
         elif axis == "y":
             depths = positions[:, 1]
         elif axis == "z":
             depths = positions[:, 2]
-        elif axis == "camera":
+        else:  # camera
             if camera_pos is None:
                 camera_pos = np.array([0.0, 0.0, 0.0])
-            depths = np.linalg.norm(positions - camera_pos, axis=1)
+            if camera_fwd is not None:
+                fwd = camera_fwd / (np.linalg.norm(camera_fwd) + 1e-12)
+                depths = (positions - camera_pos).dot(fwd)
+            else:
+                depths = np.linalg.norm(positions - camera_pos, axis=1)
         
-        # Handle either order (min can be > max if user selected in reverse)
         range_lo = min(min_depth, max_depth)
         range_hi = max(min_depth, max_depth)
-        
-        # Find points within the depth range
         in_range = (depths >= range_lo) & (depths <= range_hi)
         
-        # Use saved original colors as base, or current if not provided
         sh0_tensor = splat.sh0_raw
-        if original_sh0 is not None:
-            base_sh0 = original_sh0.copy()
-        else:
-            base_sh0 = sh0_tensor.numpy().copy()
-        
-        # Convert new colors to SH0 format
+        base_sh0 = original_sh0.copy() if original_sh0 is not None else sh0_tensor.numpy().copy()
         new_sh0_colors = (colors - 0.5) / C0
         new_sh0_colors = new_sh0_colors.reshape(-1, 1, 3).astype(np.float32)
-        
-        # Only update in-range points, keep original for out-of-range
         base_sh0[in_range] = new_sh0_colors[in_range]
-        
-        # Write back
-        new_sh0 = lf.Tensor.from_numpy(base_sh0).cuda()
-        sh0_tensor[:] = new_sh0
+        sh0_tensor[:] = lf.Tensor.from_numpy(base_sh0).cuda()
     else:
-        # Apply to all points
-        in_range = None  # All points affected
+        in_range = None
         sh0_colors = (colors - 0.5) / C0
         sh0_colors = sh0_colors.reshape(-1, 1, 3).astype(np.float32)
-        
-        new_sh0 = lf.Tensor.from_numpy(sh0_colors).cuda()
         sh0_tensor = splat.sh0_raw
-        sh0_tensor[:] = new_sh0
+        sh0_tensor[:] = lf.Tensor.from_numpy(sh0_colors).cuda()
     
-    # For grayscale mode, zero out higher-order SH to remove view-dependent color
+    # For grayscale: zero out higher-order SH to remove view-dependent colour
     if colormap == "grayscale":
         shN_tensor = splat.shN_raw
-        if shN_tensor is not None and shN_tensor.shape[0] > 0:
+        if shN_tensor is not None and shN_tensor.ndim > 0 and shN_tensor.shape[0] > 0:
             shN_np = shN_tensor.numpy().copy()
             if in_range is not None:
-                # Only zero out in-range points
                 shN_np[in_range] = 0.0
             else:
-                # Zero out all
                 shN_np[:] = 0.0
-            new_shN = lf.Tensor.from_numpy(shN_np.astype(np.float32)).cuda()
-            shN_tensor[:] = new_shN
+            shN_tensor[:] = lf.Tensor.from_numpy(shN_np.astype(np.float32)).cuda()
     
-    # Force a scene update
     scene = lf.get_scene()
     if scene:
         scene.notify_changed()
@@ -368,20 +338,12 @@ def apply_depthmap_colors(
 
 
 def get_scene_bounds(node_name: Optional[str] = None) -> Optional[BoundingBox]:
-    """Get the bounding box of a node or the entire scene.
-    
-    Args:
-        node_name: Optional node name. If None, returns scene bounds.
-        
-    Returns:
-        BoundingBox or None if no data available
-    """
+    """Get the bounding box of a node or the entire scene."""
     scene = lf.get_scene()
     if scene is None:
         return None
     
     all_positions = []
-    
     if node_name:
         node = scene.get_node(node_name)
         if node is None:
@@ -393,20 +355,16 @@ def get_scene_bounds(node_name: Optional[str] = None) -> Optional[BoundingBox]:
     for node in nodes:
         splat = node.splat_data()
         if splat is not None:
-            positions = splat.get_means().numpy()
-            all_positions.append(positions)
+            all_positions.append(splat.get_means().numpy())
             continue
-        
         pc = node.point_cloud()
         if pc is not None:
-            positions = pc.means.numpy()
-            all_positions.append(positions)
+            all_positions.append(pc.means.numpy())
     
     if not all_positions:
         return None
     
     positions = np.concatenate(all_positions, axis=0)
-    
     return BoundingBox(
         min_x=float(np.min(positions[:, 0])),
         max_x=float(np.max(positions[:, 0])),

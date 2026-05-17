@@ -4,6 +4,9 @@
 
 from typing import Optional
 import datetime
+import os
+import subprocess
+import sys
 import numpy as np
 import lichtfeld as lf
 import lichtfeld.selection as sel
@@ -138,6 +141,134 @@ def _unregister_frame_handler():
     _depth_log("UNREGISTER | (draw handler remains active)")
 
 
+# ── Viewport export helpers (inlined from export_panel) ───────────────────────
+
+import re as _re
+
+def _vp_parse_version(v: str) -> tuple:
+    parts = v.lstrip("v").split(".")[:3]
+    return tuple(int(_re.match(r"\d+", x).group()) for x in parts)
+
+_VP_Y_UP = _vp_parse_version(lf.__version__) >= (0, 5, 1)
+
+VP_RESOLUTIONS = [
+    ("Viewport",  None),
+    ("1080p HD",  1080),
+    ("1440p 2K",  1440),
+    ("4K",        2160),
+    ("8K",        4320),
+]
+
+def _vp_get_view_params():
+    view = lf.get_current_view()
+    if view is None:
+        return None
+    cam_pos = np.array(view.translation.numpy()).flatten()
+    rot = np.array(view.rotation.numpy())
+    forward = -rot[:, 2] if rot.shape == (3, 3) else np.array([0, 0, -1])
+    up_vec  =  rot[:, 1] if rot.shape == (3, 3) else np.array([0, 1,  0])
+    eye    = tuple(cam_pos.tolist())
+    target = tuple((cam_pos + forward * 10).tolist())
+    up     = tuple(up_vec.tolist())
+    fov    = float(view.fov_y)
+    vp_w   = int(view.width)
+    vp_h   = int(view.height)
+    return eye, target, up, fov, vp_w, vp_h
+
+def _vp_fix_orientation(arr: np.ndarray, from_render_at: bool) -> np.ndarray:
+    if from_render_at:
+        arr = np.flip(arr, axis=0).copy()
+    else:
+        if _VP_Y_UP:
+            arr = np.flip(arr, axis=0).copy()
+    # Additional 180° rotation (flip both axes)
+    arr = np.flip(arr, axis=0)
+    arr = np.flip(arr, axis=1).copy()                                                
+    return arr
+
+def _vp_render_at_size(width: int, height: int, bg_color=None):
+    params = _vp_get_view_params()
+    if params is None:
+        return None
+    eye, target, up, fov, _, _ = params
+    try:
+        bg_tensor = None
+        if bg_color is not None:
+            for shape_fn in [
+                lambda: np.full((height, width, 3), bg_color, dtype=np.float32),
+                lambda: np.array(bg_color, dtype=np.float32),
+                lambda: np.array([[bg_color]], dtype=np.float32),
+            ]:
+                try:
+                    bg_np = shape_fn()
+                    try:
+                        bg_tensor = lf.Tensor.from_numpy(bg_np).cuda()
+                    except Exception:
+                        bg_tensor = lf.Tensor.from_numpy(bg_np)
+                    break
+                except Exception:
+                    bg_tensor = None
+        tensor = lf.render_at(eye, target, width, height, fov, up, bg_tensor)
+        if tensor is None:
+            return None
+        arr = tensor.numpy().astype(np.float32)
+        arr = _vp_fix_orientation(arr, from_render_at=True)
+        if arr.ndim == 3 and arr.shape[2] == 4:
+            arr = arr[:, :, :3]
+        return arr
+    except Exception as e:
+        lf.log.error(f"[VPExport] render_at failed: {e}")
+        return None
+
+def _vp_capture_viewport_arr():
+    vp = lf.capture_viewport()
+    if vp is None or vp.image is None:
+        return None
+    arr = np.asarray(vp.image.cpu().contiguous(), dtype=np.float32)
+    arr = _vp_fix_orientation(arr, from_render_at=False)
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        arr = arr[:, :, :3]
+    return arr
+
+def _vp_capture_arr(target_h, bg_color=None):
+    if target_h is None:
+        return _vp_capture_viewport_arr()
+    params = _vp_get_view_params()
+    if params:
+        _, _, _, _, vp_w, vp_h = params
+        target_w = max(1, round(vp_w * target_h / max(vp_h, 1)))
+    else:
+        target_w = round(target_h * 16 / 9)
+    arr = _vp_render_at_size(target_w, target_h, bg_color=bg_color)
+    if arr is not None:
+        return arr
+    arr = _vp_capture_viewport_arr()
+    if arr is None:
+        return None
+    from PIL import Image as _Image
+    img = _Image.fromarray((arr * 255).clip(0, 255).astype(np.uint8), "RGB")
+    img = img.resize((target_w, target_h), _Image.LANCZOS)
+    return np.array(img).astype(np.float32) / 255.0
+
+def _vp_arr_to_image(arr: np.ndarray):
+    from PIL import Image as _Image
+    rgb = (arr[..., :3] * 255.0).clip(0, 255).astype(np.uint8)
+    return _Image.fromarray(rgb, "RGB")
+
+def _vp_bw2a(black_arr: np.ndarray, white_arr: np.ndarray):
+    from PIL import Image as _Image
+    b = (black_arr[..., :3] * 255.0).clip(0, 255)
+    w = (white_arr[..., :3] * 255.0).clip(0, 255)
+    diff = w - b
+    alpha = 1.0 - (np.mean(diff, axis=2) / 255.0)
+    alpha = np.clip(alpha, 0, 1)
+    recovered = b / (alpha[:, :, np.newaxis] + 1e-10)
+    recovered = np.clip(recovered, 0, 255).astype(np.uint8)
+    alpha_u8 = (alpha * 255).astype(np.uint8)
+    rgba = np.dstack([recovered, alpha_u8])
+    return _Image.fromarray(rgba, "RGBA")
+
+
 class DepthmapPanel(lf.ui.Panel):
     """Panel for depth map visualization with live preview."""
     
@@ -213,6 +344,14 @@ class DepthmapPanel(lf.ui.Panel):
         self._render_keep_frames = True
         self._render_total_frames = 300
         self._render_fps = 24
+
+        # Viewport export state (PNG only)
+        self._vp_export_resolution_idx = 0   # index into RESOLUTIONS
+        self._vp_export_compress = 3         # PNG compression 0-9
+        self._vp_export_transparency = False
+        self._vp_export_status = ""
+        self._vp_export_status_color = (1.0, 1.0, 1.0, 1.0)
+        self._vp_bw2a_state = {"step": 0}
     
     def _check_and_capture_pick(self):
         """Check if user has made a NEW selection and capture it."""
@@ -594,7 +733,7 @@ class DepthmapPanel(lf.ui.Panel):
         # Log camera position when using camera axis
         cam_info = ""
         if axis == "camera":
-            cam_pos = _get_export_camera_pos()
+            cam_pos, cam_fwd = _get_export_camera_pos()
             if cam_pos is not None:
                 cam_info = f" | cam=({cam_pos[0]:.3f},{cam_pos[1]:.3f},{cam_pos[2]:.3f})"
             else:
@@ -807,6 +946,139 @@ class DepthmapPanel(lf.ui.Panel):
                 lf.ui.request_redraw()
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _vp_set_status(self, msg, *, success=False, warning=False, error=False):
+        self._vp_export_status = msg
+        if success:
+            self._vp_export_status_color = (0.2, 1.0, 0.2, 1.0)
+        elif warning:
+            self._vp_export_status_color = (1.0, 0.8, 0.2, 1.0)
+        elif error:
+            self._vp_export_status_color = (1.0, 0.3, 0.3, 1.0)
+        else:
+            self._vp_export_status_color = (1.0, 1.0, 1.0, 1.0)
+
+    def _do_viewport_export_png(self):
+        from pathlib import Path
+
+        _, target_h = VP_RESOLUTIONS[self._vp_export_resolution_idx]
+        res_label = VP_RESOLUTIONS[self._vp_export_resolution_idx][0]
+        default_name = f"depth_{res_label.lower().replace(' ', '_')}.png"
+
+        # Save dialog
+        ps_script = f'''
+        Add-Type -AssemblyName System.Windows.Forms
+        $d = New-Object System.Windows.Forms.SaveFileDialog
+        $d.Title = "Save Viewport Depth as PNG"
+        $d.Filter = "PNG Image (*.png)|*.png"
+        $d.FileName = "{default_name}"
+        $d.DefaultExt = "png"
+        if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ Write-Output $d.FileName }}
+        '''
+        path = None
+        if sys.platform == "win32":
+            try:
+                flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps_script],
+                    capture_output=True, text=True, creationflags=flags,
+                )
+                path = result.stdout.strip() or None
+            except Exception:
+                pass
+        if not path:
+            path = str(Path(os.getcwd()) / default_name)
+
+        if not path.lower().endswith(".png"):
+            path += ".png"
+
+        if self._vp_export_transparency:
+            if target_h is not None:
+                # render_at path: two renders, explicit bg colours
+                try:
+                    self._vp_set_status("Rendering black bg...", warning=True)
+                    black = _vp_render_at_size(*self._vp_out_size(target_h), bg_color=(0.0, 0.0, 0.0))
+                    self._vp_set_status("Rendering white bg...", warning=True)
+                    white = _vp_render_at_size(*self._vp_out_size(target_h), bg_color=(1.0, 1.0, 1.0))
+                    if black is None or white is None:
+                        self._vp_set_status("BW2A render failed.", error=True)
+                        return
+                    self._vp_set_status("Computing RGBA...", warning=True)
+                    rgba_img = _vp_bw2a(black, white)
+                    rgba_img.save(path, "PNG", compress_level=self._vp_export_compress)
+                    h, w = black.shape[:2]
+                    self._vp_set_status(f"Saved {w}×{h} RGBA: {path}", success=True)
+                except Exception as e:
+                    self._vp_set_status(f"Error: {e}", error=True)
+            else:
+                # Viewport path: needs draw-handler frame sequencing
+                self._vp_bw2a_state.update({
+                    "step": 1, "black": None, "white": None,
+                    "orig_bg": None, "out_path": path,
+                })
+                self._vp_set_status("Starting BW2A capture...", warning=True)
+                lf.add_draw_handler("depthmap.vp_bw2a", self._vp_bw2a_draw_handler)
+        else:
+            try:
+                self._vp_set_status(f"Rendering {res_label}...", warning=True)
+                arr = _vp_capture_arr(target_h)
+                if arr is None:
+                    self._vp_set_status("Capture failed.", error=True)
+                    return
+                img = _vp_arr_to_image(arr)
+                img.save(path, "PNG", compress_level=self._vp_export_compress)
+                h, w = arr.shape[:2]
+                self._vp_set_status(f"Saved {w}×{h}: {path}", success=True)
+            except Exception as e:
+                self._vp_set_status(f"Error: {e}", error=True)
+
+    def _vp_out_size(self, target_h):
+        """Return (width, height) for the given target height, preserving viewport aspect."""
+        params = _vp_get_view_params()
+        if params:
+            _, _, _, _, vp_w, vp_h = params
+            return max(1, round(vp_w * target_h / max(vp_h, 1))), target_h
+        return round(target_h * 16 / 9), target_h
+
+    def _vp_bw2a_draw_handler(self, context):
+        rs = lf.get_render_settings()
+        s = self._vp_bw2a_state
+        if s["step"] == 1:
+            s["orig_bg"] = rs.background_color
+            rs.background_color = (0.0, 0.0, 0.0)
+            s["step"] = 2
+        elif s["step"] == 2:
+            self._vp_set_status("Capturing black bg...", warning=True)
+            arr = _vp_capture_viewport_arr()
+            if arr is None:
+                self._vp_set_status("Capture failed (black bg).", error=True)
+                rs.background_color = s["orig_bg"]
+                s["step"] = 0
+                lf.remove_draw_handler("depthmap.vp_bw2a")
+                return
+            s["black"] = arr
+            rs.background_color = (1.0, 1.0, 1.0)
+            s["step"] = 3
+        elif s["step"] == 3:
+            self._vp_set_status("Capturing white bg...", warning=True)
+            arr = _vp_capture_viewport_arr()
+            if arr is None:
+                self._vp_set_status("Capture failed (white bg).", error=True)
+                rs.background_color = s["orig_bg"]
+                s["step"] = 0
+                lf.remove_draw_handler("depthmap.vp_bw2a")
+                return
+            s["white"] = arr
+            rs.background_color = s["orig_bg"]
+            s["step"] = 0
+            lf.remove_draw_handler("depthmap.vp_bw2a")
+            try:
+                rgba_img = _vp_bw2a(s["black"], s["white"])
+                rgba_img.save(s["out_path"], "PNG", compress_level=self._vp_export_compress)
+                h, w = s["black"].shape[:2]
+                self._vp_set_status(f"Saved {w}×{h} RGBA: {s['out_path']}", success=True)
+            except Exception as e:
+                self._vp_set_status(f"Error: {e}", error=True)
 
     def draw(self, layout):
         theme = lf.ui.theme()
@@ -1154,3 +1426,59 @@ class DepthmapPanel(lf.ui.Panel):
                 if self._render_status:
                     color = (1.0, 0.4, 0.4, 1.0) if "ERROR" in self._render_status else (0.4, 1.0, 0.4, 1.0)
                     layout.text_colored(self._render_status, color)
+
+        # === Export Viewport PNG ===
+        layout.separator()
+        if layout.collapsing_header("Export Viewport PNG", default_open=False):
+            # Resolution picker
+            layout.label("Resolution:")
+            res_labels = [r[0] for r in VP_RESOLUTIONS]
+            changed, new_idx = layout.combo("##vp_res", self._vp_export_resolution_idx, res_labels)
+            if changed:
+                self._vp_export_resolution_idx = new_idx
+            _, target_h = VP_RESOLUTIONS[self._vp_export_resolution_idx]
+
+            # Show output dimensions
+            params = _vp_get_view_params()
+            if target_h and params:
+                _, _, _, _, vp_w, vp_h = params
+                out_w = max(1, round(vp_w * target_h / max(vp_h, 1)))
+                layout.text_colored(f"Output: {out_w} × {target_h} px  (via render_at)", theme.palette.text_dim)
+            elif target_h:
+                layout.text_colored(f"Height: {target_h} px  (via render_at)", theme.palette.text_dim)
+            else:
+                if params:
+                    _, _, _, _, vp_w, vp_h = params
+                    layout.text_colored(f"Viewport: {vp_w} × {vp_h} px", theme.palette.text_dim)
+                else:
+                    layout.text_colored("Native viewport resolution", theme.palette.text_dim)
+
+            layout.spacing()
+
+            # PNG compression
+            layout.label("PNG Compression (0 = none, 9 = max):")
+            changed, val = layout.slider_int("##vp_compress", self._vp_export_compress, 0, 9)
+            if changed:
+                self._vp_export_compress = val
+
+            layout.spacing()
+
+            # Transparency
+            changed, val = layout.checkbox("Transparency (RGBA)", self._vp_export_transparency)
+            if changed:
+                self._vp_export_transparency = val
+            if self._vp_export_transparency:
+                if target_h:
+                    layout.text_colored("  render_at black + white bg → BW2A RGBA", theme.palette.text_dim)
+                else:
+                    layout.text_colored("  Viewport black + white bg → BW2A RGBA", theme.palette.text_dim)
+
+            layout.spacing()
+
+            res_label = VP_RESOLUTIONS[self._vp_export_resolution_idx][0]
+            if layout.button(f"Export {res_label} PNG", (-1, 28 * scale)):
+                self._do_viewport_export_png()
+
+            if self._vp_export_status:
+                layout.spacing()
+                layout.text_colored(self._vp_export_status, self._vp_export_status_color)
